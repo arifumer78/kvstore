@@ -1,59 +1,82 @@
 #include <iostream>
-#include <unordered_map>
-#include <string>
 #include <optional>
+#include <unordered_map>
+#include <unistd.h>
 
-/*
- A key-value store is a place where user/applications can store/retrive data. 
- what needs to be considered is how to access data and how to store data and how to make
- it secure by programming e.g. making things private, const properly.
-*/
 class KVStore{
+    private:
+    std::unordered_map<std::string, std::string> store_;
     public:
-    void set(std::string key, std::string value){
-        data_.insert_or_assign(std::move(key), std::move(value)).second;
+    void set(const std::string& key, const std::string value){
+        store_.insert_or_assign(std::move(key), std::move(value));
     }
 
-    std::optional<std::string> get(const std::string& key) const{
-        if(auto search = data_.find(key); search != data_.end()){
-            return search->second;
+    std::optional<std::string> get(const std::string& key) const {
+        if(auto val = store_.find(key); val != store_.end()){
+            return val->second;
         }
-
         return std::nullopt;
-    } //this const means we wont be changing the internal state of the class.
+    }
 
     bool del(const std::string& key){
-        auto num_elements = data_.erase(key); //returns 0/1 number of elements remvoed.
-        
-        return (num_elements > 0);
-    } //since we are deleting things so it amounds to change of internal state.
+        auto elem = store_.erase(key);
+        return (elem > 0);
+    }
+};
 
+class Socket{
     private:
-    std::unordered_map<std::string, std::string> data_;
+    int fd_;
+    public:
+    explicit Socket(int fd) noexcept : fd_{fd} {}
+    ~Socket(){if(fd_ >= 0) ::close(fd_);}
+
+    Socket(const Socket&) = delete;
+    Socket& operator=(const Socket&) = delete;
+
+    Socket(Socket&& other) noexcept : fd_{other.fd_} {other.fd_ = -1;}
+    Socket& operttor(Socket&& other) noexcept {if(this != &other){::close(fd_); fd_ = other.fd_; other.fd_ = -1;}   return *this;}
+
+};
+
+class Listener{
+    private:
+    uint16_t port_;
+    public:
+    explicit Listener(uint16_t port) noexcept : port_{port} {}
+    void Listen() const {
+        //read from socket
+    }
+};
+
+class KVServer{
+    private:
+    KVStore store_;
+    Listener listener_;
+
+    public:
+    
 };
 
 int main(int argc, char** argv){
-    std::cout<< "initializing kv store"<<std::endl;
-    KVStore kv;
+    std::cout<<"starting kvstore app..."<<std::endl;
+    KVStore app;
 
-    //set
-    kv.set("cpp", "is tough");
-    if(auto lkup = kv.get("cpp"); lkup != std::nullopt){
-        std::cout<<" value = "<<lkup.value()<<std::endl;
-    }
-    //reset
-    kv.set("cpp", "is not so tough");
-    if(auto lkup = kv.get("cpp"); lkup != std::nullopt){
-        std::cout<<" value = "<<lkup.value()<<std::endl;
-    }
-    //del
-    kv.del("cpp");
-    if(auto lkup = kv.get("cpp"); lkup != std::nullopt){
-        std::cout<<" value = "<<lkup.value()<<std::endl;
+    if(auto val = app.get("app"); val != std::nullopt){
+        std::cout<<"key [app] returned value "<<val.value()<<std::endl;
     }
     else{
-        std::cout<<" value not found"<<std::endl;
+        std::cout<<"no value was found.."<<std::endl;
     }
 
+    app.set("app", "kv");
+
+    if(auto val = app.get("app"); val != std::nullopt){
+        std::cout<<"key [app] returned value "<<val.value()<<std::endl;
+    }
+    else{
+        std::cout<<"no value was found.."<<std::endl;
+    }
+    
     return 0;
 }
