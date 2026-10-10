@@ -200,7 +200,7 @@ class KVServer{
     }
 };
 
-int main(int argc, char** argv){
+int main(){
     std::cout<<"starting kvstore app..."<<std::endl;
 
     try{
