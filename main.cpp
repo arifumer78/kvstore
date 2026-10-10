@@ -4,21 +4,28 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <expected>
 #include <unistd.h>
 #include <string.h>
 #include <errno.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <shared_mutex>
+#include <mutex>
+#include <thread>
 
 class KVStore{
     private:
+    mutable std::shared_mutex m_;
     std::unordered_map<std::string, std::string> store_;
     public:
     void set(std::string key, std::string value){
+        std::unique_lock lk{m_};
         store_.insert_or_assign(std::move(key), std::move(value));
     }
 
     std::optional<std::string> get(const std::string& key) const {
+        std::shared_lock sk{m_};
         if(auto val = store_.find(key); val != store_.end()){
             return val->second;
         }
@@ -26,6 +33,7 @@ class KVStore{
     }
 
     bool del(const std::string& key){
+        std::unique_lock uk{m_};
         auto elem = store_.erase(key);
         return (elem > 0);
     }
@@ -53,29 +61,34 @@ class Socket{
 class Listener{
     private:
     Socket socket_;
+    explicit Listener(Socket s) noexcept : socket_{std::move(s)} {}
+    static std::unexpected<std::error_code> fail(){
+        return std::unexpected(std::error_code(errno, std::generic_category()));
+    }
     public:
-    //since we are setting things up in constructor, which can not return, it can only throw exception
-    explicit Listener(uint16_t port) : socket_{::socket(AF_INET, SOCK_STREAM, 0)} {
-        if(0 > socket_.get()){
-            throw_errno("socket()");
+    [[nodiscard]] static std::expected<Listener, std::error_code> create(std::uint16_t port){
+        Socket s{::socket(AF_INET, SOCK_STREAM, 0)};
+        if(0 > s.get()){
+            return fail();
         }
 
         int opt = 1;
-        if(0 > setsockopt(socket_.get(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))){
-            throw_errno("setsockopt()");
+        if(0 > setsockopt(s.get(), SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))){
+            return fail();
         }
 
         struct sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = INADDR_ANY;
         address.sin_port = htons(port);
-        if(0 > ::bind(socket_.get(), reinterpret_cast<struct sockaddr*>(&address), sizeof(address) ) ) {
-            throw_errno("bind()");
+        if(0 > ::bind(s.get(), reinterpret_cast<struct sockaddr*>(&address), sizeof(address) ) ) {
+            return fail();
         }
 
-        if(0 > ::listen(socket_.get(), 100)){
-            throw_errno("listen()");
+        if(0 > ::listen(s.get(), SOMAXCONN)){
+            return fail();
         }
+        return Listener{std::move(s)};
     }
 
     Socket accept(){
@@ -192,10 +205,15 @@ class KVServer{
     }
 
     public:
-    explicit KVServer(uint16_t port) : listener_{port} {}
+    explicit KVServer(Listener listener) noexcept : listener_{std::move(listener)} {}
     void run(){
         while(true){
-            serve(listener_.accept());
+            Socket client = listener_.accept();
+            std::thread([this, c = std::move(client)]() mutable{
+                serve(std::move(c));
+            }
+            ).detach();
+            //serve(listener_.accept());
         }
     }
 };
@@ -204,7 +222,12 @@ int main(){
     std::cout<<"starting kvstore app..."<<std::endl;
 
     try{
-        KVServer server{6379};
+        auto listener = Listener::create(6379);
+        if(!listener){
+            std::cerr<<"listener error "<< listener.error().message()<<std::endl;
+            return 1;
+        }
+        KVServer server{std::move(*listener)};
         server.run();
     }catch(std::system_error& e){
         std::cerr << e.what() << std::endl;
