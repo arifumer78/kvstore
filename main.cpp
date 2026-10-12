@@ -13,6 +13,8 @@
 #include <shared_mutex>
 #include <mutex>
 #include <thread>
+#include <fcntl.h>
+#include <sys/epoll.h>
 
 class KVStore{
     private:
@@ -91,6 +93,9 @@ class Listener{
         return Listener{std::move(s)};
     }
 
+    // add inside Listener, public:
+    int fd() const noexcept { return socket_.get(); }
+
     Socket accept(){
         while(true){
             int fd = ::accept(socket_.get(), nullptr, nullptr);
@@ -165,11 +170,36 @@ std::string execute(KVStore& kv, const Command& c) {
     return "ERR usage: SET key value | GET key | DEL key\n";
 }
 
+struct Connection{
+    Socket socket_;
+    std::string buf;
+};
+
 class KVServer{
     private:
     static constexpr std::size_t kMaxLine = 64 * 1024;
     KVStore store_;
     Listener listener_;
+    Socket epoll_;
+    std::unordered_map<int, Connection> clients_;
+
+    bool set_nonblocking(int fd){
+        int flags = ::fcntl(fd, F_SETFL, 0);
+        return flags >= 0 && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0;
+    }
+
+    int watch(int fd){
+        epoll_event ev{};
+        ev.data.fd = fd;
+        ev.events = EPOLLIN;
+        return ::epoll_ctl(epoll_.get(), EPOLL_CTL_ADD, fd, &ev) == 0;
+    }
+
+    void drop(int fd){
+        ::epoll_ctl(epoll_.get(), EPOLL_CTL_DEL, fd, nullptr);
+        clients_.erase(fd);
+    }
+
     void serve(Socket client){
         std::string buf;
         char chunk[4096];
@@ -204,15 +234,78 @@ class KVServer{
         }
     }
 
+    void accept_all(){
+        while(true){
+            int fd = ::accept4(listener_.fd(), nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            if(fd < 0){
+                if(errno == EWOULDBLOCK || errno == EAGAIN) return;
+                if(errno == EINTR || errno == ECONNABORTED) continue;
+                throw_errno("accept4()");
+            }
+            //now need to add to clients_<int, Connection>
+            if(!watch(fd)) continue;
+            Socket sock{fd};
+            clients_.emplace(fd, Connection{std::move(sock), {}});
+        }
+    }
+
+    void handle_clients(int fd){
+        auto it = clients_.find(fd);
+        if (it == clients_.end()) return;
+        Connection& c = it->second;
+
+        bool closed = false;
+        char chunk[4096];
+        while (true) {                                   // read everything available now
+            ssize_t n = ::read(fd, chunk, sizeof chunk);
+            if (n > 0) { c.buf.append(chunk, static_cast<std::size_t>(n)); continue; }
+            if (n == 0) { closed = true; break; }        // client closed
+            if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break;  // drained for now
+            closed = true; break;                        // real error
+        }
+
+        std::size_t pos;
+        while ((pos = c.buf.find('\n')) != std::string::npos) {
+            std::string_view line{c.buf.data(), pos};
+            if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+            std::string reply = execute(store_, parse_command(line));
+            c.buf.erase(0, pos + 1);
+            if (!write_all(fd, reply)) { drop(fd); return; }
+        }
+
+        if (!closed && c.buf.size() > kMaxLine) {
+            write_all(fd, "ERR line too long\n");
+            closed = true;
+        }
+        if (closed) drop(fd);
+
+    }
+
     public:
-    explicit KVServer(Listener listener) noexcept : listener_{std::move(listener)} {}
+    explicit KVServer(Listener listener) noexcept : listener_{std::move(listener)}, epoll_{::epoll_create1(EPOLL_CLOEXEC)} {
+        if (epoll_.get() < 0) throw_errno("epoll_create1()");
+        if (!set_nonblocking(listener_.fd())) throw_errno("fcntl()");
+        if (!watch(listener_.fd())) throw_errno("epoll_ctl()");
+    }
     void run(){
         while(true){
-            Socket client = listener_.accept();
+            std::array<epoll_event, 64> events;
+            int n = ::epoll_wait(epoll_.get(), events.data(), static_cast<int>(events.size()), -1);
+            if(n < 0){
+                if(errno == EINTR){ continue;}
+                throw_errno("epoll_wait()");
+            }
+            for(int i = 0; i < n; ++i){
+                int fd = events[i].data.fd;
+                if(fd == listener_.fd()) accept_all();
+                else handle_clients(fd);
+            }
+            /*Socket client = listener_.accept();
             std::thread([this, c = std::move(client)]() mutable{
                 serve(std::move(c));
             }
-            ).detach();
+            ).detach();*/
             //serve(listener_.accept());
         }
     }
